@@ -1,0 +1,23 @@
+# окружение проекта и кэш Python
+.venv/
+__pycache__/
+
+# технические файлы уроков: страницы, шпаргалки, заметки, спеки
+/lessons/
+/reference/
+/assets/
+/learning-records/
+/.scratch/
+/MISSION.md
+/NOTES.md
+/RESOURCES.md
+/GLOSSARY.md
+
+# ИИ-агенты: их папки, навыки (skills) Мэтта Покока, инструкции
+/.agents/
+/.claude/
+/.zcode/
+/docs/
+/AGENTS.md
+/CLAUDE.md
+/skills-lock.json
