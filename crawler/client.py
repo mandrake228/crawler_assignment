@@ -1,19 +1,23 @@
 """Асинхронный HTTP-клиент: класс AsyncCrawler загружает страницы параллельно."""
 
 import asyncio
+import codecs
 import logging
 import time
-from urllib.parse import urlsplit
 
 import aiohttp
 
 from crawler.errors import (
     CrawlerError, FailureKind, FetchError, InvalidArgumentError, is_whole, shown,
 )
+from crawler.parser import HTMLParser, unparsed_page
+from crawler.urls import require_url, require_urls
 
 logger = logging.getLogger(__name__)
 
 MAX_TIMEOUT = 3600  # секунд: таймаут длиннее часа — уже не таймаут
+HTML_TYPES = ("text/html", "application/xhtml+xml")  # ответ такого типа разбирается
+SLOW_CODEC = "punycode"  # кодировка имён хостов: страницу читает минутами
 
 
 def require_count(name, value):
@@ -36,44 +40,14 @@ def require_seconds(name, value):
     return value
 
 
-def require_url(value):
-    """Вернуть value, если это адрес http(s) с хостом и без пароля; иначе отказать."""
-    if type(value) is not str:
-        raise InvalidArgumentError(f"url: нужна строка, получено {shown(value)}")
-    try:
-        parts = urlsplit(value)
-        # чтение порта заодно проверяет его: не число или больше 65535 — ValueError
-        scheme, host, _ = parts.scheme, parts.hostname, parts.port
-        secret = parts.username is not None or parts.password is not None
-        (host or "").encode("idna")  # имя хоста с пустой частью, как в a..b
-    except ValueError:  # негодный порт, скобка адреса IPv6, имя хоста
-        scheme, host, secret = "", None, False
-    if secret:
-        raise InvalidArgumentError("url: адрес с логином или паролем не принимается")
-    clean = value.isprintable() and " " not in value  # без пробелов и переводов строки
-    if scheme not in ("http", "https") or not host or not clean:
-        raise InvalidArgumentError(
-            "url: нужен адрес вида http://хост или https://хост, "
-            f"получено {shown(value)}"
-        )
-    return value
-
-
-def require_urls(values):
-    """Вернуть список адресов, если это список или кортеж годных адресов."""
-    if type(values) not in (list, tuple):
-        raise InvalidArgumentError(
-            f"urls: нужен список или кортеж адресов, получено {shown(values)}"
-        )
-    return [require_url(value) for value in values]
-
-
 def to_text(body, encoding):
     """Превратить байты страницы в текст; нечитаемые байты заменить знаком �."""
     try:
-        return body.decode(encoding, errors="replace")
+        if codecs.lookup(encoding).name != SLOW_CODEC:
+            return body.decode(encoding, errors="replace")
     except (LookupError, ValueError):  # сервер назвал кодировку не для текста
-        return body.decode("utf-8", errors="replace")
+        pass
+    return body.decode("utf-8", errors="replace")
 
 
 class AsyncCrawler:
@@ -91,9 +65,17 @@ class AsyncCrawler:
         connect_timeout: float = CONNECT_TIMEOUT,
         read_timeout: float = READ_TIMEOUT,
         total_timeout: float = TOTAL_TIMEOUT,
+        parser: HTMLParser | None = None,
     ) -> None:
         """Запомнить настройки; сеть не трогается до первого запроса."""
         self._max_concurrent = require_count("max_concurrent", max_concurrent)
+        if parser is None:
+            parser = HTMLParser()
+        elif not isinstance(parser, HTMLParser):  # наследник парсера годится
+            raise InvalidArgumentError(
+                f"parser: нужен HTMLParser или None, получено {shown(parser)}"
+            )
+        self._parser = parser
         self._timeout = aiohttp.ClientTimeout(
             total=require_seconds("total_timeout", total_timeout),
             connect=require_seconds("connect_timeout", connect_timeout),
@@ -109,6 +91,11 @@ class AsyncCrawler:
     def max_concurrent(self):
         """Предел конкурентности: сколько запросов идёт одновременно."""
         return self._max_concurrent
+
+    @property
+    def parser(self):
+        """Парсер, которым краулер разбирает загруженные страницы."""
+        return self._parser
 
     def _open(self):
         """Вернуть сессию и семафор; при первом запросе создать их."""
@@ -141,6 +128,11 @@ class AsyncCrawler:
 
     async def fetch_url(self, url: str) -> str:
         """Загрузить одну страницу и вернуть её текст; сбой — FetchError."""
+        text, _, _ = await self._load(url)
+        return text
+
+    async def _load(self, url):
+        """Проверить адрес, дождаться очереди, загрузить: текст, адрес, тип."""
         require_url(url)
         session, semaphore = self._open()
         self._pending += 1
@@ -154,13 +146,15 @@ class AsyncCrawler:
                 self._idle.set()  # страниц в работе нет: close() может закрывать
 
     async def _fetch(self, session, url):
-        """Выполнить запрос; сбой библиотеки превратить в FetchError."""
+        """Выполнить запрос: текст, адрес ответа и тип содержимого."""
         logger.info("начало: %s", url)
         started = time.perf_counter()
         try:
             async with session.get(url) as response:
                 response.raise_for_status()  # код от 400 — исключение
                 status = response.status
+                address = str(response.url)  # адрес после перенаправлений
+                content_type = response.content_type  # без charset и регистра
                 body = await response.read()
                 encoding = response.get_encoding()
         # порядок веток важен: первые две ошибки — тоже потомки ClientError
@@ -177,7 +171,7 @@ class AsyncCrawler:
         logger.info(
             "успех: %s — код %s, %s симв., %.2f с", url, status, len(text), seconds
         )
-        return text
+        return text, address, content_type
 
     @staticmethod
     def _failure(url, kind, error, status=None):
@@ -185,6 +179,23 @@ class AsyncCrawler:
         failure = FetchError(url, kind, type(error).__name__, status)
         logger.warning("сбой: %s", failure)
         return failure
+
+    async def fetch_and_parse(self, url: str) -> dict:
+        """Загрузить страницу и разобрать её; сбой загрузки — FetchError."""
+        text, address, content_type = await self._load(url)
+        if content_type not in HTML_TYPES:
+            shown_type = shown(content_type)
+            logger.warning("не HTML: %s — тип %s, разбора нет", url, shown_type)
+            return unparsed_page(url)
+        try:
+            require_url(address)
+        except InvalidArgumentError:
+            logger.warning("адрес ответа не годится: ссылки считаются от %s", url)
+            address = url
+        # семафор уже свободен: разбор не занимает место в очереди загрузок
+        page = await self._parser.parse_html(text, address)
+        page["url"] = url  # в результате — адрес, который просили
+        return page
 
     async def fetch_urls(self, urls: list[str]) -> dict[str, str]:
         """Загрузить страницы параллельно; вернуть «URL → текст» для удачных."""

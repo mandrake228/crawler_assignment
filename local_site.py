@@ -6,6 +6,7 @@ import sys
 from aiohttp import web
 
 from crawler.errors import CrawlerError, InvalidArgumentError, is_whole, shown
+from sample_pages import PAGES
 
 HOST = "127.0.0.1"  # адрес «этот компьютер»: снаружи сайт не виден
 DEFAULT_PORT = 8421  # порт по умолчанию; занят — передайте сайту другой
@@ -59,6 +60,22 @@ async def drop(request):
     return web.Response()  # обработчик обязан вернуть ответ; клиент его не получит
 
 
+async def html_page(request):
+    """Учебная страница HTML по имени; неизвестное имя — код 404."""
+    name = request.match_info["name"]
+    if name not in PAGES:
+        raise web.HTTPNotFound(text="Такой учебной страницы нет")
+    return web.Response(text=PAGES[name], content_type="text/html")
+
+
+async def moved(request):
+    """Перенаправление на ту же учебную страницу по более глубокому пути."""
+    target = f"/deep/a/b/{request.match_info['name']}"
+    if request.query_string:  # запрос из адреса сохраняется
+        target += "?" + request.query_string
+    raise web.HTTPFound(target)
+
+
 ROUTES = [
     web.get("/page/{name}", page),
     web.get(r"/slow/{ms:\d{1,4}}", slow),
@@ -66,6 +83,9 @@ ROUTES = [
     web.get(r"/charset/{name:[a-z0-9-]{1,20}}", charset),
     web.get(r"/drip/{count:\d{1,2}}", drip),
     web.get("/drop", drop),
+    web.get("/html/{name}", html_page),
+    web.get("/deep/a/b/{name}", html_page),
+    web.get("/moved/{name}", moved),
 ]
 
 
